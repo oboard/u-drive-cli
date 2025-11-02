@@ -71,7 +71,7 @@ func getToken() (string, error) {
 
 	// 如果缓存不存在或已过期，重新登录获取token
 	loginData := url.Values{}
-	loginData.Set("loginName", "hfdhdfhfd")
+	loginData.Set("loginName", "oboard10@teml.net")
 	loginData.Set("password", "Aa123456")
 
 	// 创建一个 cookie jar
@@ -299,14 +299,14 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	defer tempFile.Close()
 
 	// 将上传的文件复制到临时文件
-	if _, err := io.Copy(tempFile, file); err != nil {
-		http.Error(w, fmt.Sprintf("保存文件失败: %v", err), http.StatusInternalServerError)
+	if _, saveErr := io.Copy(tempFile, file); saveErr != nil {
+		http.Error(w, fmt.Sprintf("保存文件失败: %v", saveErr), http.StatusInternalServerError)
 		return
 	}
 
 	// 重置文件指针到开始位置
-	if _, err := tempFile.Seek(0, 0); err != nil {
-		http.Error(w, fmt.Sprintf("重置文件指针失败: %v", err), http.StatusInternalServerError)
+	if _, seekErr := tempFile.Seek(0, 0); seekErr != nil {
+		http.Error(w, fmt.Sprintf("重置文件指针失败: %v", seekErr), http.StatusInternalServerError)
 		return
 	}
 
