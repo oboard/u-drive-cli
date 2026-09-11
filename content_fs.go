@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -311,19 +312,14 @@ func (fs *contentFileSystem) OpenFile(ctx context.Context, name string, flag int
 		if existing != nil && !existing.isFolder() {
 			existingMeta = existing
 		}
-		tmp, err := os.CreateTemp("", "udrive-content-upload-*")
-		if err != nil {
-			return nil, err
-		}
 		return &contentFile{
 			session:  s,
 			name:     cleaned,
 			parentID: parentID,
 			title:    title,
 			meta:     existingMeta,
-			tmp:      tmp,
-			tmpPath:  tmp.Name(),
 			write:    true,
+			buf:      &bytes.Buffer{}, // 内存缓冲，Close 时流式加密上传
 		}, nil
 	}
 	meta, err := s.resolve(ctx, cleaned)
@@ -470,9 +466,10 @@ type contentFile struct {
 	parentID int64
 	title    string
 	meta     *contentFileInfo
-	tmp      *os.File
-	tmpPath  string
-	write    bool
+	tmp      *os.File      // 读场景：临时文件（解密后）
+	tmpPath  string        // 读场景：临时文件路径
+	write    bool          // 写场景标记
+	buf      *bytes.Buffer // 写场景：内存缓冲
 }
 
 func openRemoteContentFile(s *contentSession, name string, meta *contentFileInfo) (webdav.File, error) {
@@ -507,37 +504,43 @@ func openRemoteContentFile(s *contentSession, name string, meta *contentFileInfo
 
 func (f *contentFile) Read(p []byte) (int, error)         { return f.tmp.Read(p) }
 func (f *contentFile) Seek(o int64, w int) (int64, error) { return f.tmp.Seek(o, w) }
-func (f *contentFile) Write(p []byte) (int, error)        { return f.tmp.Write(p) }
+func (f *contentFile) Write(p []byte) (int, error) {
+	if f.buf != nil {
+		return f.buf.Write(p)
+	}
+	return 0, fmt.Errorf("写入未初始化")
+}
 func (f *contentFile) Readdir(int) ([]os.FileInfo, error) {
 	return nil, fmt.Errorf("%s 不是目录", f.name)
 }
 func (f *contentFile) Stat() (os.FileInfo, error) {
 	if f.write {
-		st, err := f.tmp.Stat()
-		if err != nil {
-			return nil, err
+		size := int64(0)
+		if f.buf != nil {
+			size = int64(f.buf.Len())
 		}
-		return &contentInfo{name: f.title, size: st.Size(), modTime: time.Now(), isDir: false}, nil
+		return &contentInfo{name: f.title, size: size, modTime: time.Now(), isDir: false}, nil
 	}
 	return contentFileInfoToOS(f.name, f.meta), nil
 }
 
 func (f *contentFile) Close() error {
-	defer os.Remove(f.tmpPath)
+	// 读场景：删除临时文件
 	if !f.write {
-		return f.tmp.Close()
+		if f.tmpPath != "" {
+			defer os.Remove(f.tmpPath)
+		}
+		if f.tmp != nil {
+			return f.tmp.Close()
+		}
+		return nil
 	}
-	if _, err := f.tmp.Seek(0, io.SeekStart); err != nil {
-		return err
+	// 写场景：从内存缓冲流式加密上传
+	if f.buf == nil {
+		return nil
 	}
-	plainSize, err := readerSize(f.tmp)
-	if err != nil {
-		return err
-	}
-	if _, err := f.tmp.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	enc, err := newEncryptReader(f.tmp, f.session.key)
+	plainSize := int64(f.buf.Len())
+	enc, err := newEncryptReader(f.buf, f.session.key)
 	if err != nil {
 		return err
 	}
@@ -569,7 +572,7 @@ func (f *contentFile) Close() error {
 		}
 	}
 	f.session.invalidate(f.parentID)
-	return f.tmp.Close()
+	return nil
 }
 
 func extNoDot(name string) string {
