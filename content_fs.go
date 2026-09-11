@@ -429,13 +429,6 @@ func (i *contentInfo) ModTime() time.Time { return i.modTime }
 func (i *contentInfo) IsDir() bool        { return i.isDir }
 func (i *contentInfo) Sys() any           { return nil }
 
-// ETag 实现 webdav.ETager 接口，为 davfs2 提供缓存验证。
-// 格式："contentID-modTime"（双引号包裹）
-func (i *contentInfo) ETag(ctx context.Context) (string, error) {
-	etag := fmt.Sprintf(`"%d-%d"`, i.contentID, i.modTime.UnixNano())
-	return etag, nil
-}
-
 type contentDir struct {
 	session *contentSession
 	name    string
@@ -473,6 +466,14 @@ func (d *contentDir) Readdir(count int) ([]os.FileInfo, error) {
 	out := d.infos[d.offset:end]
 	d.offset = end
 	return out, nil
+}
+
+// ETag 实现 webdav.ETager 接口。
+func (d *contentDir) ETag(ctx context.Context) (string, error) {
+	if d.meta == nil {
+		return "", nil
+	}
+	return fmt.Sprintf(`"%d-%d"`, d.meta.ContentID, d.meta.modTime().UnixNano()), nil
 }
 
 type contentFile struct {
@@ -628,6 +629,14 @@ func (f *contentFile) Stat() (os.FileInfo, error) {
 		return &contentInfo{name: f.title, size: size, modTime: time.Now(), isDir: false}, nil
 	}
 	return contentFileInfoToOS(f.name, f.meta), nil
+}
+
+// ETag 实现 webdav.ETager 接口。
+func (f *contentFile) ETag(ctx context.Context) (string, error) {
+	if f.meta == nil {
+		return "", nil
+	}
+	return fmt.Sprintf(`"%d-%d"`, f.meta.ContentID, f.meta.modTime().UnixNano()), nil
 }
 
 func (f *contentFile) Close() error {
