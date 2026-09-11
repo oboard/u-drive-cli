@@ -12,47 +12,77 @@ import (
 	"golang.org/x/net/webdav"
 )
 
+// indexedWebDAVFS 从 request context 解析当前用户，委托到其专属索引。
 type indexedWebDAVFS struct {
-	index *webDAVIndex
+	store *userIndexes
+}
+
+func (fs indexedWebDAVFS) idx(ctx context.Context) (*webDAVIndex, error) {
+	u, p, ok := credsFromCtx(ctx)
+	if !ok {
+		return nil, os.ErrPermission
+	}
+	return fs.store.indexFor(u, p)
 }
 
 func (fs indexedWebDAVFS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
-	return fs.index.stat(name)
+	idx, err := fs.idx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return idx.stat(name)
 }
 
 func (fs indexedWebDAVFS) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
-	return fs.index.mkdir(name)
+	idx, err := fs.idx(ctx)
+	if err != nil {
+		return err
+	}
+	return idx.mkdir(name)
 }
 
 func (fs indexedWebDAVFS) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (webdav.File, error) {
+	idx, err := fs.idx(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	cleaned, err := cleanWebDAVPath(name)
 	if err != nil {
 		return nil, err
 	}
 
-	entry, err := fs.index.entry(cleaned)
+	entry, err := idx.entry(cleaned)
 	if err == nil && entry.IsDir {
-		return &indexDir{index: fs.index, name: cleaned}, nil
+		return &indexDir{index: idx, name: cleaned}, nil
 	}
 
 	isWrite := flag&os.O_CREATE != 0 || flag&os.O_TRUNC != 0 || flag&os.O_RDWR != 0 || flag&os.O_WRONLY != 0
 	if isWrite {
-		return fs.index.openForWrite(cleaned, flag)
+		return idx.openForWrite(cleaned, flag)
 	}
 
-	file, cleanupPath, _, err := fs.index.openCacheFile(cleaned)
+	file, cleanupPath, _, err := idx.openCacheFile(cleaned)
 	if err != nil {
 		return nil, err
 	}
-	return &indexFile{index: fs.index, name: cleaned, file: file, cleanupPath: cleanupPath}, nil
+	return &indexFile{index: idx, name: cleaned, file: file, cleanupPath: cleanupPath}, nil
 }
 
 func (fs indexedWebDAVFS) RemoveAll(ctx context.Context, name string) error {
-	return fs.index.removeAll(ctx, name)
+	idx, err := fs.idx(ctx)
+	if err != nil {
+		return err
+	}
+	return idx.removeAll(ctx, name)
 }
 
 func (fs indexedWebDAVFS) Rename(ctx context.Context, oldName, newName string) error {
-	return fs.index.rename(ctx, oldName, newName)
+	idx, err := fs.idx(ctx)
+	if err != nil {
+		return err
+	}
+	return idx.rename(ctx, oldName, newName)
 }
 
 type indexDir struct {
@@ -166,19 +196,17 @@ func (idx *webDAVIndex) openForWrite(name string, flag int) (webdav.File, error)
 	return &indexFile{index: idx, name: cleaned, file: tempFile, tempPath: tempPath}, nil
 }
 
-func startWebDAVServer(username, addr, prefix, user, pass string, noAuth bool, indexPath, cacheDir string) error {
+func startWebDAVServer(addr, prefix string, noAuth bool, baseDir string) error {
 	backend := obsUploadBackend{}
 
-	// 「凭证即密钥」：密钥由 username+password 纯函数派生，无需 keyring/备份。
-	if username == "" {
-		return fmt.Errorf("WebDAV 需要 --username（用于加密密钥派生与隔离）")
+	if baseDir == "" {
+		var err error
+		baseDir, err = defaultDataDir()
+		if err != nil {
+			return err
+		}
 	}
-	dek := deriveKey(username, pass)
-
-	index, err := newWebDAVIndex(indexPath, cacheDir, backend, dek, username)
-	if err != nil {
-		return fmt.Errorf("初始化 WebDAV 索引失败: %v", err)
-	}
+	store := newUserIndexes(baseDir, backend)
 
 	if prefix == "" {
 		prefix = "/dav"
@@ -186,7 +214,7 @@ func startWebDAVServer(username, addr, prefix, user, pass string, noAuth bool, i
 		prefix = path.Clean("/" + prefix)
 	}
 
-	fs := indexedWebDAVFS{index: index}
+	fs := indexedWebDAVFS{store: store}
 	handler := &webdav.Handler{
 		Prefix:     prefix,
 		FileSystem: fs,
@@ -200,33 +228,25 @@ func startWebDAVServer(username, addr, prefix, user, pass string, noAuth bool, i
 
 	var httpHandler http.Handler = handler
 	if !noAuth {
-		httpHandler = basicAuth(handler, user, pass)
+		httpHandler = authMiddleware(handler)
 	}
 
 	fmt.Printf("WebDAV 服务器启动在 http://%s%s\n", addr, prefix)
 	fmt.Printf("列表来自本地索引（upload-only hack，不代表远端真实内容）\n")
+	fmt.Printf("多用户：按每个请求的 Basic Auth 账号（username/password）隔离加密空间\n")
 	return http.ListenAndServe(addr, httpHandler)
 }
 
-func basicAuth(next http.Handler, user, pass string) http.Handler {
+// authMiddleware 校验请求带非空 Basic Auth，并把 username/password 注入 context，
+// 供 FileSystem 解析对应用户的密钥与索引（凭证即密钥，无需预配账号）。
+func authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		u, p, ok := r.BasicAuth()
-		if !ok || !secureStringEqual(u, user) || !secureStringEqual(p, pass) {
+		if !ok || u == "" || p == "" {
 			w.Header().Set("WWW-Authenticate", `Basic realm="udrive"`)
-			http.Error(w, "未授权", http.StatusUnauthorized)
+			http.Error(w, "未授权（需要用户名和密码）", http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(withCreds(r.Context(), u, p)))
 	})
-}
-
-func secureStringEqual(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var diff byte
-	for i := 0; i < len(a); i++ {
-		diff |= a[i] ^ b[i]
-	}
-	return diff == 0
 }

@@ -59,17 +59,18 @@ func newTestIndex(t *testing.T, backend uploadBackend) *webDAVIndex {
 	return idx
 }
 
-// newTestIndexWithDEK 用法相同但带一个 DEK，验证加密路径。
-func newTestIndexWithDEK(t *testing.T, backend uploadBackend, dek []byte) *webDAVIndex {
+// newTestProdFS 构建多用户 FS：返回带凭据上下文 ctx(对应 testfs 用户) 与对应索引。
+// 生产 indexedWebDAVFS 从 ctx 解析用户，因此这些直接调用需要 ctx 携带凭据。
+func newTestProdFS(t *testing.T, backend uploadBackend, username, password string) (indexedWebDAVFS, context.Context, *webDAVIndex) {
 	t.Helper()
-	dir := t.TempDir()
-	indexPath := filepath.Join(dir, "index.json")
-	cacheDir := filepath.Join(dir, "cache")
-	idx, err := newWebDAVIndex(indexPath, cacheDir, backend, dek, "tester")
+	base := t.TempDir()
+	store := newUserIndexes(base, backend)
+	idx, err := store.indexFor(username, password)
 	if err != nil {
-		t.Fatalf("newWebDAVIndex: %v", err)
+		t.Fatalf("indexFor: %v", err)
 	}
-	return idx
+	ctx := withCreds(context.Background(), username, password)
+	return indexedWebDAVFS{store: store}, ctx, idx
 }
 
 func TestCleanWebDAVPath(t *testing.T) {
@@ -157,14 +158,11 @@ func TestMkdirAndPropfind(t *testing.T) {
 
 func TestPutGetDelete(t *testing.T) {
 	backend := newFakeUploadBackend(nil)
-	idx := newTestIndex(t, backend)
+	fs, ctx, idx := newTestProdFS(t, backend, "tester", "pw")
 
-	fs := indexedWebDAVFS{index: idx}
-	if err := fs.Mkdir(context.Background(), "/dir", 0755); err != nil {
+	if err := fs.Mkdir(ctx, "/dir", 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-
-	ctx := context.Background()
 
 	// PUT via OpenFile writing path
 	f, err := fs.OpenFile(ctx, "/dir/hello.txt", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0666)
@@ -189,8 +187,8 @@ func TestPutGetDelete(t *testing.T) {
 	if !strings.HasPrefix(flatKey, "tester-dir-hello.txt-") {
 		t.Errorf("扁平 key 应含 username+路径+时间戳: %q", flatKey)
 	}
-	if got := backend.objects[flatKey]; !bytes.Equal(got, []byte("hello world")) {
-		t.Errorf("uploaded content = %q", got)
+	if got := backend.objects[flatKey]; bytes.Contains(got, []byte("hello world")) {
+		t.Errorf("OBS 对象应为密文，不应含明文 %q: %q", flatKey, got)
 	}
 
 	// GET (read from cache)
@@ -221,9 +219,7 @@ func TestPutGetDelete(t *testing.T) {
 
 func TestMoveAndCopy(t *testing.T) {
 	backend := newFakeUploadBackend(nil)
-	idx := newTestIndex(t, backend)
-	fs := indexedWebDAVFS{index: idx}
-	ctx := context.Background()
+	fs, ctx, idx := newTestProdFS(t, backend, "tester", "pw")
 
 	if err := fs.Mkdir(ctx, "/src", 0755); err != nil {
 		t.Fatal(err)
@@ -245,8 +241,8 @@ func TestMoveAndCopy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := backend.objects[moved.RemotePath]; !bytes.Equal(got, []byte("data")) {
-		t.Errorf("move should upload to new flat key %q, got %q", moved.RemotePath, got)
+	if got := backend.objects[moved.RemotePath]; bytes.Contains(got, []byte("data")) {
+		t.Errorf("move 上传对象应为密文: %q", moved.RemotePath)
 	}
 	if _, err := fs.Stat(ctx, "/src/a.txt"); err == nil {
 		t.Error("old path should be gone")
@@ -258,13 +254,14 @@ func TestMoveAndCopy(t *testing.T) {
 
 func TestHTTPWebDAVServer(t *testing.T) {
 	backend := newFakeUploadBackend(nil)
-	idx := newTestIndex(t, backend)
+	fs, _, idx := newTestProdFS(t, backend, "tester", "pw")
 
-	handler := &webdav.Handler{
+	origin := &webdav.Handler{
 		Prefix:     "/dav",
-		FileSystem: indexedWebDAVFS{index: idx},
+		FileSystem: fs,
 		LockSystem: webdav.NewMemLS(),
 	}
+	handler := authMiddleware(origin)
 
 	if err := idx.mkdir("/folder"); err != nil {
 		t.Fatal(err)
@@ -272,6 +269,7 @@ func TestHTTPWebDAVServer(t *testing.T) {
 
 	do := func(method, path string, body io.Reader, headers map[string]string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, "/dav"+path, body)
+		req.SetBasicAuth("tester", "pw")
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
@@ -305,10 +303,10 @@ func TestBasicAuth(t *testing.T) {
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(204)
 	})
-	h := basicAuth(inner, "u", "p")
+	h := authMiddleware(inner)
 
 	req := httptest.NewRequest("GET", "/x", nil)
-	req.SetBasicAuth("u", "p")
+	req.SetBasicAuth("alice", "pw")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 204 {
@@ -320,6 +318,19 @@ func TestBasicAuth(t *testing.T) {
 	if rec2.Code != http.StatusUnauthorized {
 		t.Errorf("no auth status=%d, want 401", rec2.Code)
 	}
+
+	// 空密码应拒绝
+	rec3 := httptest.NewRecorder()
+	h.ServeHTTP(rec3, mustReqWithBasic("GET", "/x", "alice", ""))
+	if rec3.Code != http.StatusUnauthorized {
+		t.Errorf("empty password status=%d, want 401", rec3.Code)
+	}
+}
+
+func mustReqWithBasic(method, path, user, pass string) *http.Request {
+	req := httptest.NewRequest(method, path, nil)
+	req.SetBasicAuth(user, pass)
+	return req
 }
 
 func TestIndexPersistence(t *testing.T) {
@@ -348,10 +359,7 @@ func TestIndexPersistence(t *testing.T) {
 // TestEncryptedPutGet — 加密路径：上传内容在 OBS 是密文，GET 能解回明文。
 func TestEncryptedPutGet(t *testing.T) {
 	backend := newFakeUploadBackend(nil)
-	dek := deriveKey("alice", "secret")
-	idx := newTestIndexWithDEK(t, backend, dek)
-	fs := indexedWebDAVFS{index: idx}
-	ctx := context.Background()
+	fs, ctx, idx := newTestProdFS(t, backend, "alice", "secret")
 
 	if err := fs.Mkdir(ctx, "/dir", 0755); err != nil {
 		t.Fatal(err)
@@ -370,7 +378,15 @@ func TestEncryptedPutGet(t *testing.T) {
 	}
 
 	// OBS 对象必须是密文（不包含明文内容）
-	remote := backend.objects["dir/secret.txt"]
+	entry, err := idx.entry("/dir/secret.txt")
+	if err != nil {
+		t.Fatalf("entry: %v", err)
+	}
+	flatKey := entry.RemotePath
+	if strings.Contains(flatKey, "/") {
+		t.Errorf("扁平 key 不应含 /: %q", flatKey)
+	}
+	remote := backend.objects[flatKey]
 	if bytes.Contains(remote, []byte("topsecret data")) {
 		t.Error("OBS 对象不应包含明文内容")
 	}
@@ -428,5 +444,49 @@ func TestEncryptedIndexIsCiphertext(t *testing.T) {
 	}
 	if bytes.Contains(raw, []byte("abcdef")) || bytes.Contains(raw, []byte("entries")) {
 		t.Error("索引文件不应是明文 JSON")
+	}
+}
+
+// TestMultiUserIsolation 单服务器多用户：不同账号登录彼此隔离，各自索引/密钥独立。
+func TestMultiUserIsolation(t *testing.T) {
+	backend := newFakeUploadBackend(nil)
+	store := newUserIndexes(t.TempDir(), backend)
+	fs := indexedWebDAVFS{store: store}
+
+	origin := &webdav.Handler{Prefix: "/dav", FileSystem: fs, LockSystem: webdav.NewMemLS()}
+	handler := authMiddleware(origin)
+
+	do := func(user, pass, method, path string, body io.Reader) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, "/dav"+path, body)
+		req.SetBasicAuth(user, pass)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// alice 上传一个文件
+	if rec := do("alice", "pw", "PUT", "/sol.txt", strings.NewReader("alice secret file")); rec.Code >= 300 {
+		t.Fatalf("alice PUT status=%d", rec.Code)
+	}
+
+	// alice 能读到
+	if rec := do("alice", "pw", "GET", "/sol.txt", nil); rec.Code != http.StatusOK || rec.Body.String() != "alice secret file" {
+		t.Fatalf("alice GET status=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	// bob（不同账号）看不到 alice 的文件：GET 应 404，列表里也没有
+	if rec := do("bob", "pw", "GET", "/sol.txt", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("bob GET alice 的文件应 404, got %d", rec.Code)
+	}
+
+	// bob 用自己的账号上传同路径，互不覆盖 alice 的索引
+	if rec := do("bob", "pw", "PUT", "/sol.txt", strings.NewReader("bob own")); rec.Code >= 300 {
+		t.Fatalf("bob PUT status=%d", rec.Code)
+	}
+	if rec := do("bob", "pw", "GET", "/sol.txt", nil); rec.Body.String() != "bob own" {
+		t.Fatalf("bob GET=%q", rec.Body.String())
+	}
+	if rec := do("alice", "pw", "GET", "/sol.txt", nil); rec.Body.String() != "alice secret file" {
+		t.Fatalf("alice 数据被 bob 影响? GET=%q", rec.Body.String())
 	}
 }

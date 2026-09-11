@@ -22,6 +22,81 @@ type uploadBackend interface {
 	ClearObject(ctx context.Context, remotePath string) error
 }
 
+// --- 多用户运行时鉴权（凭证即密钥） ---
+//
+// 启动时无需预配任何账号。每次 WebDAV 请求经 Basic Auth 的 username+password，
+// auth 中间件把凭据注入 request context；FileSystem 从 ctx 取凭据，找到/创建
+// 对应用户的索引（密钥 = KDF(username, password)，索引/缓存按 username 分目录）。
+
+type credsCtxKey struct{}
+
+// withCreds 把鉴权后的 username/password 写入上下文。
+func withCreds(ctx context.Context, username, password string) context.Context {
+	return context.WithValue(ctx, credsCtxKey{}, [2]string{username, password})
+}
+
+// credsFromCtx 从上下文读取 username/password。
+func credsFromCtx(ctx context.Context) (string, string, bool) {
+	v, ok := ctx.Value(credsCtxKey{}).([2]string)
+	if !ok {
+		return "", "", false
+	}
+	return v[0], v[1], true
+}
+
+// userIndexes 按 username 惰性构建各自的 webDAVIndex（密钥、索引、缓存均按用户隔离）。
+type userIndexes struct {
+	mu      sync.Mutex
+	baseDir string
+	backend uploadBackend
+	cache   map[string]*webDAVIndex
+}
+
+func newUserIndexes(baseDir string, backend uploadBackend) *userIndexes {
+	return &userIndexes{
+		baseDir: baseDir,
+		backend: backend,
+		cache:   make(map[string]*webDAVIndex),
+	}
+}
+
+// indexFor 返回 username 对应的索引；首访该用户时才用其密码派生密钥并初始化目录。
+func (s *userIndexes) indexFor(username, password string) (*webDAVIndex, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if idx, ok := s.cache[username]; ok {
+		return idx, nil
+	}
+
+	userBase := sanitizeUserDir(username)
+	indexPath := filepath.Join(s.baseDir, userBase, "webdav-index.json")
+	cacheDir := filepath.Join(s.baseDir, userBase, "webdav-cache")
+
+	dek := deriveKey(username, password)
+	idx, err := newWebDAVIndex(indexPath, cacheDir, s.backend, dek, username)
+	if err != nil {
+		return nil, err
+	}
+	s.cache[username] = idx
+	return idx, nil
+}
+
+// sanitizeUserDir 清洗 username 用作目录名，防止路径穿越。
+func sanitizeUserDir(username string) string {
+	u := strings.ReplaceAll(username, "\\", "/")
+	u = strings.Trim(u, "/")
+	if u == "" || u == "." || u == ".." {
+		return "_default"
+	}
+	for _, part := range strings.Split(u, "/") {
+		if part == ".." {
+			return "_default"
+		}
+	}
+	return u
+}
+
 type obsUploadBackend struct{}
 
 func (obsUploadBackend) PutObject(ctx context.Context, remotePath string, reader io.Reader) (*obsUploadResult, error) {
@@ -119,17 +194,23 @@ func newWebDAVIndex(indexPath, cacheDir string, backend uploadBackend, dek []byt
 	return idx, nil
 }
 
-func defaultWebDAVPaths() (string, string, error) {
+func defaultDataDir() (string, error) {
 	cacheRoot, err := os.UserCacheDir()
 	if err != nil || cacheRoot == "" {
 		home, homeErr := os.UserHomeDir()
 		if homeErr != nil {
-			return "", "", fmt.Errorf("获取缓存目录失败: %v", err)
+			return "", fmt.Errorf("获取缓存目录失败: %v", err)
 		}
 		cacheRoot = filepath.Join(home, ".cache")
 	}
+	return filepath.Join(cacheRoot, "udrive"), nil
+}
 
-	base := filepath.Join(cacheRoot, "udrive")
+func defaultWebDAVPaths() (string, string, error) {
+	base, err := defaultDataDir()
+	if err != nil {
+		return "", "", err
+	}
 	return filepath.Join(base, "webdav-index.json"), filepath.Join(base, "webdav-cache"), nil
 }
 
