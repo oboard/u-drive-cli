@@ -400,14 +400,21 @@ func contentFileInfoToOS(name string, meta *contentFileInfo) os.FileInfo {
 	if name == "/" {
 		filename = "/"
 	}
-	return &contentInfo{name: filename, size: meta.ContentSize, modTime: meta.modTime(), isDir: meta.isFolder()}
+	return &contentInfo{
+		name:      filename,
+		size:      meta.ContentSize,
+		modTime:   meta.modTime(),
+		isDir:     meta.isFolder(),
+		contentID: meta.ContentID,
+	}
 }
 
 type contentInfo struct {
-	name    string
-	size    int64
-	modTime time.Time
-	isDir   bool
+	name      string
+	size      int64
+	modTime   time.Time
+	isDir     bool
+	contentID int64 // 用于生成 ETag
 }
 
 func (i *contentInfo) Name() string { return i.name }
@@ -421,6 +428,13 @@ func (i *contentInfo) Mode() os.FileMode {
 func (i *contentInfo) ModTime() time.Time { return i.modTime }
 func (i *contentInfo) IsDir() bool        { return i.isDir }
 func (i *contentInfo) Sys() any           { return nil }
+
+// ETag 实现 webdav.ETager 接口，为 davfs2 提供缓存验证。
+// 格式："contentID-modTime"（双引号包裹）
+func (i *contentInfo) ETag(ctx context.Context) (string, error) {
+	etag := fmt.Sprintf(`"%d-%d"`, i.contentID, i.modTime.UnixNano())
+	return etag, nil
+}
 
 type contentDir struct {
 	session *contentSession

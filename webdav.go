@@ -32,13 +32,23 @@ func startWebDAVServer(addr, prefix string, noAuth bool) error {
 	}
 
 	var httpHandler http.Handler = handler
-	if !noAuth {
+	if noAuth {
+		// no-auth 模式：注入默认凭据
+		httpHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := withCreds(r.Context(), "default", "default")
+			handler.ServeHTTP(w, r.WithContext(ctx))
+		})
+	} else {
 		httpHandler = authMiddleware(handler)
 	}
 
 	fmt.Printf("WebDAV 服务器启动在 http://%s%s\n", addr, prefix)
 	fmt.Printf("目录树来自 uLearning 内容 API（多设备共享同一份远端数据）\n")
-	fmt.Printf("多用户：按每个请求的 Basic Auth 账号（username/password）派生根目录与加密密钥\n")
+	if noAuth {
+		fmt.Printf("警告：--no-auth 模式，使用默认凭据 default/default\n")
+	} else {
+		fmt.Printf("多用户：按每个请求的 Basic Auth 账号（username/password）派生根目录与加密密钥\n")
+	}
 	return http.ListenAndServe(addr, httpHandler)
 }
 
