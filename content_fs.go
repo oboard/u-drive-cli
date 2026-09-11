@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/webdav"
+	"oboard.fun/udrive/webdav"
 )
 
 // content_fs.go — 基于 uLearning 内容 API 的 WebDAV 文件系统。

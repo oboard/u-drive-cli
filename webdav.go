@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"path"
 
-	"golang.org/x/net/webdav"
+	"oboard.fun/udrive/webdav"
 )
 
 // webdav.go — WebDAV 服务器装配。
