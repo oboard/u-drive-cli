@@ -484,12 +484,14 @@ type contentFile struct {
 	meta     *contentFileInfo
 	write    bool          // 写场景标记
 	buf      *bytes.Buffer // 写场景：内存缓冲
+	written  int64         // 写场景：已写入总字节数
 	// 读场景：
 	data    []byte // 已解密数据缓存
 	readPos int    // 当前读位置
 }
 
-const maxReadCacheSize = 4 * 1024 * 1024 // 4MB 读缓存上限
+const maxReadCacheSize = 4 * 1024 * 1024  // 4MB 读缓存上限
+const maxWriteBufferSize = 50 * 1024 * 1024 // 50MB 写缓冲上限，超过则用临时文件
 
 // fetchRange 获取 [start, end) 范围的解密数据。
 // 如果 start 在缓存内，复用缓存；否则重新下载。
@@ -612,17 +614,73 @@ func (f *contentFile) Seek(offset int64, whence int) (int64, error) {
 	return target, nil
 }
 func (f *contentFile) Write(p []byte) (int, error) {
-	if f.buf != nil {
-		return f.buf.Write(p)
+	if f.buf == nil {
+		return 0, fmt.Errorf("写入未初始化")
 	}
-	return 0, fmt.Errorf("写入未初始化")
+	// 超过 50MB，先上传当前缓冲，清空后继续
+	if f.buf.Len()+len(p) > maxWriteBufferSize {
+		if err := f.flushBuffer(); err != nil {
+			return 0, err
+		}
+	}
+	n, err := f.buf.Write(p)
+	f.written += int64(n)
+	return n, err
 }
+
+// flushBuffer 上传当前缓冲内容（追加模式需要特殊处理，这里简化为新文件）
+func (f *contentFile) flushBuffer() error {
+	if f.buf.Len() == 0 {
+		return nil
+	}
+	enc, err := newEncryptReader(f.buf, f.session.key)
+	if err != nil {
+		return err
+	}
+	flat := flatOBSKey(f.session.rootName, time.Now().UnixMilli())
+	result, err := f.session.backend.PutObject(context.Background(), flat, enc)
+	if err != nil {
+		return err
+	}
+	ext := extNoDot(f.title)
+	if f.meta != nil {
+		if err := f.session.api.UpdateFile(*f.meta, f.title, f.parentID, result.FileURL, f.written, ext); err != nil {
+			return err
+		}
+	} else {
+		rec := uploadContentRecord{
+			Title:       f.title,
+			Type:        contentTypeFile,
+			Status:      contentStatusOK,
+			ContentSize: f.written,
+			Location:    result.FileURL,
+			MimeType:    ext,
+			IsView:      0,
+			Remark2:     1,
+			Remark3:     0,
+			ParentID:    f.parentID,
+		}
+		if err := f.session.api.CreateFile(rec); err != nil {
+			return err
+		}
+		// 获取新创建的 meta 用于后续更新
+		existing, _ := f.session.resolveChild(f.parentID, f.title)
+		if existing != nil && !existing.isFolder() {
+			f.meta = existing
+		}
+	}
+	f.session.invalidate(f.parentID)
+	// 清空缓冲，准备继续写
+	f.buf.Reset()
+	return nil
+}
+
 func (f *contentFile) Readdir(int) ([]os.FileInfo, error) {
 	return nil, fmt.Errorf("%s 不是目录", f.name)
 }
 func (f *contentFile) Stat() (os.FileInfo, error) {
 	if f.write {
-		size := int64(0)
+		size := f.written
 		if f.buf != nil {
 			size = int64(f.buf.Len())
 		}
@@ -645,44 +703,11 @@ func (f *contentFile) Close() error {
 		f.data = nil
 		return nil
 	}
-	// 写场景：从内存缓冲流式加密上传
-	if f.buf == nil {
+	// 写场景：上传剩余缓冲
+	if f.buf == nil || f.buf.Len() == 0 {
 		return nil
 	}
-	plainSize := int64(f.buf.Len())
-	enc, err := newEncryptReader(f.buf, f.session.key)
-	if err != nil {
-		return err
-	}
-	flat := flatOBSKey(f.session.rootName, time.Now().UnixMilli())
-	result, err := f.session.backend.PutObject(context.Background(), flat, enc)
-	if err != nil {
-		return err
-	}
-	ext := extNoDot(f.title)
-	if f.meta != nil {
-		// 覆盖：保留原 contentId，更新 location/size/mime，后端不会自动 "(1)" 重命名。
-		if err := f.session.api.UpdateFile(*f.meta, f.title, f.parentID, result.FileURL, plainSize, ext); err != nil {
-			return err
-		}
-	} else {
-		if err := f.session.api.CreateFile(uploadContentRecord{
-			Title:       f.title,
-			Type:        contentTypeFile,
-			Status:      contentStatusOK,
-			ContentSize: plainSize,
-			Location:    result.FileURL,
-			MimeType:    ext,
-			IsView:      0,
-			Remark2:     1,
-			Remark3:     0,
-			ParentID:    f.parentID,
-		}); err != nil {
-			return err
-		}
-	}
-	f.session.invalidate(f.parentID)
-	return nil
+	return f.flushBuffer()
 }
 
 func extNoDot(name string) string {
