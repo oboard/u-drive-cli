@@ -34,8 +34,11 @@ jobs:
 
       - name: Build
         run: |
-          go build -v -o udrive-${{ matrix.os }}-${{ matrix.arch }} ./...
+          go build -v -o udrive-${{ matrix.os }}-${{ matrix.arch }} .
         env:
+          GOOS: ${{ matrix.os == 'ubuntu-latest' && 'linux' || matrix.os == 'windows-latest' && 'windows' || 'darwin' }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: '0'
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Test
