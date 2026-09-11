@@ -376,7 +376,6 @@ func main() {
 	wdavPort := webdavCmd.Int("port", 8080, "监听端口")
 	wdavPrefix := webdavCmd.String("prefix", "/dav", "WebDAV 前缀路径")
 	wdavNoAuth := webdavCmd.Bool("no-auth", false, "禁用 Basic Auth（仅供本机调试）")
-	wdavDataDir := webdavCmd.String("data-dir", "", "各用户索引/缓存根目录（默认用户缓存目录 ~/.cache/udrive）")
 
 	// 检查命令行参数
 	if len(os.Args) < 2 || os.Args[1] == "-h" || os.Args[1] == "--help" {
@@ -387,12 +386,11 @@ func main() {
 		fmt.Println("  delete <filename>    删除文件")
 		fmt.Println("  serve --port PORT    启动HTTP服务器")
 		fmt.Println("    可通过POST请求参数remotename指定上传后的文件名")
-		fmt.Println("  webdav --port PORT   启动多用户 upload-only WebDAV 服务器")
+		fmt.Println("  webdav --port PORT   启动多用户 WebDAV 服务器（基于 uLearning 内容 API）")
 		fmt.Println("    --addr ADDR        监听地址（默认 127.0.0.1）")
 		fmt.Println("    --prefix PATH      挂载前缀（默认 /dav）")
-		fmt.Println("    --data-dir PATH    各用户数据根目录（默认 ~/.cache/udrive）")
 		fmt.Println("    --no-auth          禁用 Basic Auth（仅本机调试）")
-		fmt.Println("  账号即登录凭据：客户端挂载时填的 username/password 即为加密密钥与隔离")
+		fmt.Println("  账号即登录凭据：客户端挂载时填的 username/password 派生各用户的根目录与加密密钥")
 		fmt.Println("\n选项:")
 		fmt.Println("  -h, --help           显示帮助信息")
 		os.Exit(1)
@@ -451,7 +449,7 @@ func main() {
 		webdavCmd.Parse(os.Args[2:])
 
 		addr := fmt.Sprintf("%s:%d", *wdavAddr, *wdavPort)
-		if err := startWebDAVServer(addr, *wdavPrefix, *wdavNoAuth, *wdavDataDir); err != nil {
+		if err := startWebDAVServer(addr, *wdavPrefix, *wdavNoAuth); err != nil {
 			log.Fatalf("WebDAV 服务器启动失败: %v", err)
 		}
 	default:
