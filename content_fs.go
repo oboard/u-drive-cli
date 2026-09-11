@@ -329,7 +329,8 @@ func (fs *contentFileSystem) OpenFile(ctx context.Context, name string, flag int
 	if meta.isFolder() {
 		return &contentDir{session: s, name: cleaned, meta: meta}, nil
 	}
-	return openRemoteContentFile(s, cleaned, meta)
+	// 读文件：延迟加载，只在 Read/Seek 时才下载
+	return &contentFile{session: s, name: cleaned, meta: meta}, nil
 }
 
 func (fs *contentFileSystem) RemoveAll(ctx context.Context, name string) error {
@@ -466,44 +467,135 @@ type contentFile struct {
 	parentID int64
 	title    string
 	meta     *contentFileInfo
-	tmp      *os.File      // 读场景：临时文件（解密后）
-	tmpPath  string        // 读场景：临时文件路径
 	write    bool          // 写场景标记
 	buf      *bytes.Buffer // 写场景：内存缓冲
+	// 读场景：
+	data    []byte // 已解密数据缓存
+	readPos int    // 当前读位置
 }
 
-func openRemoteContentFile(s *contentSession, name string, meta *contentFileInfo) (webdav.File, error) {
-	resp, err := http.Get(meta.Location)
-	if err != nil {
-		return nil, err
+const maxReadCacheSize = 4 * 1024 * 1024 // 4MB 读缓存上限
+
+// fetchRange 获取 [start, end) 范围的解密数据。
+// 如果 start 在缓存内，复用缓存；否则重新下载。
+func (f *contentFile) fetchRange(start int) error {
+	// start 在缓存范围内，无需重新下载
+	if start <= len(f.data) && len(f.data) > 0 {
+		return nil
 	}
-	defer resp.Body.Close()
+
+	// 需要重新下载，丢弃旧缓存
+	f.data = f.data[:0]
+	f.readPos = 0
+
+	resp, err := http.Get(f.meta.Location)
+	if err != nil {
+		return err
+	}
 	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("下载远端文件失败: %s", resp.Status)
+		resp.Body.Close()
+		return fmt.Errorf("下载远端文件失败: %s", resp.Status)
 	}
-	dec, err := newDecryptReader(resp.Body, s.key)
+	dec, err := newDecryptReader(resp.Body, f.session.key)
 	if err != nil {
-		return nil, err
+		resp.Body.Close()
+		return err
 	}
-	tmp, err := os.CreateTemp("", "udrive-content-read-*")
-	if err != nil {
-		return nil, err
+
+	// 读取到 start 位置（丢弃）
+	if start > 0 {
+		discard := make([]byte, 4096)
+		need := start
+		for need > 0 {
+			toRead := len(discard)
+			if toRead > need {
+				toRead = need
+			}
+			n, err := dec.Read(discard[:toRead])
+			need -= n
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				resp.Body.Close()
+				return err
+			}
+		}
 	}
-	if _, err := io.Copy(tmp, dec); err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
-		return nil, err
+
+	// 从 start 开始读取并缓存（最多 maxReadCacheSize）
+	cacheCap := maxReadCacheSize
+	if f.meta.ContentSize-int64(start) < int64(maxReadCacheSize) {
+		cacheCap = int(f.meta.ContentSize - int64(start) + 1)
 	}
-	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
-		return nil, err
+	f.data = make([]byte, 0, cacheCap)
+	buf := make([]byte, 4096)
+	for {
+		toRead := len(buf)
+		if len(f.data)+toRead > cap(f.data) {
+			toRead = cap(f.data) - len(f.data)
+			if toRead <= 0 {
+				break
+			}
+		}
+		n, err := dec.Read(buf[:toRead])
+		if n > 0 {
+			f.data = append(f.data, buf[:n]...)
+		}
+		if err != nil {
+			break
+		}
 	}
-	return &contentFile{session: s, name: name, meta: meta, tmp: tmp, tmpPath: tmp.Name()}, nil
+	resp.Body.Close()
+	return nil
 }
 
-func (f *contentFile) Read(p []byte) (int, error)         { return f.tmp.Read(p) }
-func (f *contentFile) Seek(o int64, w int) (int64, error) { return f.tmp.Seek(o, w) }
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (f *contentFile) Read(p []byte) (int, error) {
+	if f.write {
+		return 0, fmt.Errorf("写入模式不支持读")
+	}
+	// 确保当前位置的数据已缓存
+	if err := f.fetchRange(f.readPos); err != nil {
+		return 0, err
+	}
+	// 从缓存读取
+	if f.readPos >= len(f.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, f.data[f.readPos:])
+	f.readPos += n
+	return n, nil
+}
+
+func (f *contentFile) Seek(offset int64, whence int) (int64, error) {
+	if f.write {
+		return 0, fmt.Errorf("写入模式不支持 Seek")
+	}
+	// 计算目标位置
+	var target int64
+	switch whence {
+	case io.SeekStart:
+		target = offset
+	case io.SeekCurrent:
+		target = int64(f.readPos) + offset
+	case io.SeekEnd:
+		target = f.meta.ContentSize + offset
+	default:
+		return 0, fmt.Errorf("无效的 whence: %d", whence)
+	}
+	if target < 0 {
+		return 0, fmt.Errorf("负位置")
+	}
+	f.readPos = int(target)
+	return target, nil
+}
 func (f *contentFile) Write(p []byte) (int, error) {
 	if f.buf != nil {
 		return f.buf.Write(p)
@@ -525,14 +617,9 @@ func (f *contentFile) Stat() (os.FileInfo, error) {
 }
 
 func (f *contentFile) Close() error {
-	// 读场景：删除临时文件
+	// 读场景：释放缓存
 	if !f.write {
-		if f.tmpPath != "" {
-			defer os.Remove(f.tmpPath)
-		}
-		if f.tmp != nil {
-			return f.tmp.Close()
-		}
+		f.data = nil
 		return nil
 	}
 	// 写场景：从内存缓冲流式加密上传
