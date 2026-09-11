@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -70,9 +69,18 @@ func getToken() (string, error) {
 	}
 
 	// 如果缓存不存在或已过期，重新登录获取token
+	loginName := os.Getenv("UDRIVE_LOGIN_NAME")
+	if loginName == "" {
+		loginName = "oboard10@teml.net"
+	}
+	password := os.Getenv("UDRIVE_PASSWORD")
+	if password == "" {
+		password = "Aa123456"
+	}
+
 	loginData := url.Values{}
-	loginData.Set("loginName", "oboard10@teml.net")
-	loginData.Set("password", "Aa123456")
+	loginData.Set("loginName", loginName)
+	loginData.Set("password", password)
 
 	// 创建一个 cookie jar
 	jar, err := cookiejar.New(nil)
@@ -329,12 +337,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func deleteFile(filename string) error {
-	// 创建空文件内容
-	emptyContent := bytes.NewReader([]byte{})
-
-	// 上传空文件（覆盖原文件）
-	_, _, err := uploadToObs(emptyContent, filename)
-	if err != nil {
+	if err := clearRemoteObject(filename); err != nil {
 		return fmt.Errorf("删除文件失败: %v", err)
 	}
 
@@ -360,12 +363,24 @@ func main() {
 	uploadCmd := flag.NewFlagSet("upload", flag.ExitOnError)
 	deleteCmd := flag.NewFlagSet("delete", flag.ExitOnError)
 	serveCmd := flag.NewFlagSet("serve", flag.ExitOnError)
+	webdavCmd := flag.NewFlagSet("webdav", flag.ExitOnError)
 
 	// 定义serve命令的端口参数
 	port := serveCmd.Int("port", 8080, "服务器端口号")
 
 	// 定义upload命令的重命名参数
 	remoteName := uploadCmd.String("r", "", "上传后的文件名")
+
+	// 定义webdav命令参数
+	wdavAddr := webdavCmd.String("addr", "127.0.0.1", "监听地址")
+	wdavPort := webdavCmd.Int("port", 8080, "监听端口")
+	wdavPrefix := webdavCmd.String("prefix", "/dav", "WebDAV 前缀路径")
+	wdavUser := webdavCmd.String("user", "", "Basic Auth 用户名（也读取 UDRIVE_WEBDAV_USER）")
+	wdavPass := webdavCmd.String("pass", "", "Basic Auth 密码（也读取 UDRIVE_WEBDAV_PASS）")
+	wdavNoAuth := webdavCmd.Bool("no-auth", false, "禁用 Basic Auth（仅供本机调试）")
+	wdavIndex := webdavCmd.String("index", "", "WebDAV 索引文件路径（默认用户缓存目录）")
+	wdavCache := webdavCmd.String("cache-dir", "", "WebDAV 缓存目录（默认用户缓存目录）")
+	wdavUsername := webdavCmd.String("username", "", "对应用户唯一 ID（加密密钥派生与隔离）")
 
 	// 检查命令行参数
 	if len(os.Args) < 2 || os.Args[1] == "-h" || os.Args[1] == "--help" {
@@ -376,6 +391,12 @@ func main() {
 		fmt.Println("  delete <filename>    删除文件")
 		fmt.Println("  serve --port PORT    启动HTTP服务器")
 		fmt.Println("    可通过POST请求参数remotename指定上传后的文件名")
+		fmt.Println("  webdav --port PORT   启动 upload-only WebDAV 服务器")
+		fmt.Println("    --username ID      用户唯一 ID（加密密钥派生与隔离）")
+		fmt.Println("    --addr ADDR        监听地址（默认 127.0.0.1）")
+		fmt.Println("    --prefix PATH      挂载前缀（默认 /dav）")
+		fmt.Println("    --user / --pass    Basic Auth 凭证")
+		fmt.Println("    --no-auth          禁用 Basic Auth（仅本机调试）")
 		fmt.Println("\n选项:")
 		fmt.Println("  -h, --help           显示帮助信息")
 		os.Exit(1)
@@ -429,6 +450,37 @@ func main() {
 		serveCmd.Parse(os.Args[2:])
 		if err := startServer(*port); err != nil {
 			log.Fatalf("服务器启动失败: %v", err)
+		}
+	case "webdav":
+		webdavCmd.Parse(os.Args[2:])
+
+		username := *wdavUsername
+		if username == "" {
+			username = os.Getenv("UDRIVE_WEBDAV_USER")
+		}
+
+		user := *wdavUser
+		if user == "" {
+			user = os.Getenv("UDRIVE_WEBDAV_USER")
+		}
+		pass := *wdavPass
+		if pass == "" {
+			pass = os.Getenv("UDRIVE_WEBDAV_PASS")
+		}
+
+		if username == "" {
+			fmt.Println("错误: WebDAV 需要 --username（作为用户唯一 ID 与加密密钥派生依据）")
+			os.Exit(1)
+		}
+		if !*wdavNoAuth && (user == "" || pass == "") {
+			fmt.Println("错误: WebDAV 需要 --user 和 --pass（或 UDRIVE_WEBDAV_USER / UDRIVE_WEBDAV_PASS 环境变量）")
+			fmt.Println("      仅本机调试可加 --no-auth")
+			os.Exit(1)
+		}
+
+		addr := fmt.Sprintf("%s:%d", *wdavAddr, *wdavPort)
+		if err := startWebDAVServer(username, addr, *wdavPrefix, user, pass, *wdavNoAuth, *wdavIndex, *wdavCache); err != nil {
+			log.Fatalf("WebDAV 服务器启动失败: %v", err)
 		}
 	default:
 		fmt.Printf("未知命令: %s\n", os.Args[1])
