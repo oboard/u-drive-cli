@@ -97,7 +97,7 @@ type apiClient interface {
 	GetMeta(id int64) (*contentFileInfo, error)
 	CreateFolder(title string, parentID int64) error
 	CreateFile(rec uploadContentRecord) error
-	UpdateFile(meta contentFileInfo, newTitle string, newParentID int64) error
+	UpdateFile(meta contentFileInfo, newTitle string, newParentID int64, newLocation string, newSize int64, newMime string) error
 	DeleteContent(ids []int64) error
 }
 
@@ -224,16 +224,32 @@ func (c *httpContentAPI) CreateFile(rec uploadContentRecord) error {
 	return c.postRecord(rec)
 }
 
-// UpdateFile 更新记录（改名 / 换目录）。
-func (c *httpContentAPI) UpdateFile(meta contentFileInfo, newTitle string, newParentID int64) error {
+// UpdateFile 更新记录（改名 / 换目录 / 覆盖内容）。
+func (c *httpContentAPI) UpdateFile(meta contentFileInfo, newTitle string, newParentID int64, newLocation string, newSize int64, newMime string) error {
+	if newTitle == "" {
+		newTitle = meta.Title
+	}
+	if newParentID == 0 {
+		newParentID = meta.parentIDOf()
+	}
+	if newLocation == "" {
+		newLocation = meta.Location
+	}
+	if newSize == 0 {
+		newSize = meta.ContentSize
+	}
+	if newMime == "" {
+		newMime = meta.MimeType
+	}
+
 	body := map[string]any{
 		"contentId":   meta.ContentID,
 		"parentId":    newParentID,
 		"title":       newTitle,
 		"type":        meta.Type,
-		"mimeType":    meta.MimeType,
-		"contentSize": meta.ContentSize,
-		"location":    meta.Location,
+		"mimeType":    newMime,
+		"contentSize": newSize,
+		"location":    newLocation,
 		"status":      meta.Status,
 		"isView":      meta.IsView,
 		"remark":      meta.Remark,

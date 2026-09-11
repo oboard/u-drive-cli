@@ -192,7 +192,12 @@ func (s *contentSession) resolve(ctx context.Context, name string) (*contentFile
 		return nil, err
 	}
 	if cleaned == "/" {
-		return &contentFileInfo{ContentID: 0, Title: "/", Type: contentTypeFolder, ContentSize: 0}, nil
+		rootID, err := s.root(ctx)
+		if err != nil {
+			return nil, err
+		}
+		// WebDAV 的 / 对应内容 API 中该用户的 hash 根目录，而不是 account 根(parentId=0)。
+		return &contentFileInfo{ContentID: rootID, Title: "/", Type: contentTypeFolder, ContentSize: 0}, nil
 	}
 	parentID, err := s.root(ctx)
 	if err != nil {
@@ -299,11 +304,27 @@ func (fs *contentFileSystem) OpenFile(ctx context.Context, name string, flag int
 		if err != nil {
 			return nil, err
 		}
+		// 若同名文件已存在（覆盖场景），捕获其 meta，
+		// Close 时走 UpdateFile 让后端覆盖原记录，避免被自动重命名为 "(1).txt"。
+		existing, _ := s.resolveChild(parentID, title)
+		var existingMeta *contentFileInfo
+		if existing != nil && !existing.isFolder() {
+			existingMeta = existing
+		}
 		tmp, err := os.CreateTemp("", "udrive-content-upload-*")
 		if err != nil {
 			return nil, err
 		}
-		return &contentFile{session: s, name: cleaned, parentID: parentID, title: title, tmp: tmp, tmpPath: tmp.Name(), write: true}, nil
+		return &contentFile{
+			session:  s,
+			name:     cleaned,
+			parentID: parentID,
+			title:    title,
+			meta:     existingMeta,
+			tmp:      tmp,
+			tmpPath:  tmp.Name(),
+			write:    true,
+		}, nil
 	}
 	meta, err := s.resolve(ctx, cleaned)
 	if err != nil {
@@ -349,7 +370,8 @@ func (fs *contentFileSystem) Rename(ctx context.Context, oldName, newName string
 	if err != nil {
 		return err
 	}
-	if err := s.api.UpdateFile(*oldMeta, newTitle, newParentID); err != nil {
+	// Rename 不改文件内容，传空 location/size/mime 让 UpdateFile 保留原值。
+	if err := s.api.UpdateFile(*oldMeta, newTitle, newParentID, "", 0, ""); err != nil {
 		return err
 	}
 	oldParentID := oldMeta.parentIDOf()
@@ -525,19 +547,26 @@ func (f *contentFile) Close() error {
 		return err
 	}
 	ext := extNoDot(f.title)
-	if err := f.session.api.CreateFile(uploadContentRecord{
-		Title:       f.title,
-		Type:        contentTypeFile,
-		Status:      contentStatusOK,
-		ContentSize: plainSize,
-		Location:    result.FileURL,
-		MimeType:    ext,
-		IsView:      0,
-		Remark2:     1,
-		Remark3:     0,
-		ParentID:    f.parentID,
-	}); err != nil {
-		return err
+	if f.meta != nil {
+		// 覆盖：保留原 contentId，更新 location/size/mime，后端不会自动 "(1)" 重命名。
+		if err := f.session.api.UpdateFile(*f.meta, f.title, f.parentID, result.FileURL, plainSize, ext); err != nil {
+			return err
+		}
+	} else {
+		if err := f.session.api.CreateFile(uploadContentRecord{
+			Title:       f.title,
+			Type:        contentTypeFile,
+			Status:      contentStatusOK,
+			ContentSize: plainSize,
+			Location:    result.FileURL,
+			MimeType:    ext,
+			IsView:      0,
+			Remark2:     1,
+			Remark3:     0,
+			ParentID:    f.parentID,
+		}); err != nil {
+			return err
+		}
 	}
 	f.session.invalidate(f.parentID)
 	return f.tmp.Close()

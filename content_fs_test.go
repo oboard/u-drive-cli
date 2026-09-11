@@ -112,7 +112,7 @@ func (f *fakeContentAPI) CreateFile(rec uploadContentRecord) error {
 	return nil
 }
 
-func (f *fakeContentAPI) UpdateFile(meta contentFileInfo, newTitle string, newParentID int64) error {
+func (f *fakeContentAPI) UpdateFile(meta contentFileInfo, newTitle string, newParentID int64, newLocation string, newSize int64, newMime string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	oldParent := meta.parentIDOf()
@@ -124,9 +124,18 @@ func (f *fakeContentAPI) UpdateFile(meta contentFileInfo, newTitle string, newPa
 			break
 		}
 	}
-	// 放入新父目录（改名/换目录）
+	// 放入新父目录（改名/换目录/覆盖内容）
 	meta.Title = newTitle
 	meta.ParentID = newParentID
+	if newLocation != "" {
+		meta.Location = newLocation
+	}
+	if newSize != 0 {
+		meta.ContentSize = newSize
+	}
+	if newMime != "" {
+		meta.MimeType = newMime
+	}
 	meta.LastModDate = time.Now().UnixMilli()
 	f.children[newParentID] = append(f.children[newParentID], meta)
 	return nil
@@ -167,7 +176,7 @@ func (f *fakeContentAPI) findRootFolder(title string) (*contentFileInfo, bool) {
 
 // jsonNumber 把 status 数字转 json.RawMessage 形态（contentFileInfo.Status）。
 func jsonNumber(n int) []byte {
-	return []byte(fmt.Sprintf("%d", n))
+	return fmt.Appendf(nil, "%d", n)
 }
 
 // ---------------------------------------------------------------- fake uploadBackend
@@ -651,5 +660,67 @@ func TestSessionCacheInvalidation(t *testing.T) {
 	}
 	if _, err := fs.Stat(ctx, "/fresh-dir"); !os.IsNotExist(err) {
 		t.Errorf("RemoveAll 后立刻 Stat 应 ErrNotExist, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------- 覆盖写入（无 (1) 后缀）
+
+// TestOverwriteSamePath 验证向同一路径写两次不会产生 "(1).txt" 重复记录。
+func TestOverwriteSamePath(t *testing.T) {
+	fs, ctx, api, backend := newTestFS(t, "alice", "pw-overwrite")
+	defer backend.Close()
+
+	// 第一次写入
+	plain1 := []byte("version 1")
+	putFile(t, fs, ctx, "/doc.txt", plain1)
+
+	// 确认只有一条记录
+	if len(api.createdFiles) != 1 {
+		t.Fatalf("第一次写入后 createdFiles 数量 = %d, want 1", len(api.createdFiles))
+	}
+	firstRec := api.createdFiles[0]
+	if firstRec.Title != "doc.txt" {
+		t.Errorf("第一次写入 Title = %q, want %q", firstRec.Title, "doc.txt")
+	}
+
+	// 读回验证
+	got1 := getFile(t, fs, ctx, "/doc.txt")
+	if !bytes.Equal(got1, plain1) {
+		t.Errorf("第一次读回不匹配: got %q, want %q", got1, plain1)
+	}
+
+	// 第二次写入（覆盖）
+	plain2 := []byte("version 2 - longer content here")
+	putFile(t, fs, ctx, "/doc.txt", plain2)
+
+	// 不应产生新 CreateFile 记录（覆盖走 UpdateFile）
+	if len(api.createdFiles) != 1 {
+		t.Errorf("覆盖写入后 createdFiles 数量 = %d, want 1（覆盖不应新增记录）", len(api.createdFiles))
+	}
+
+	// 读回应是新内容
+	got2 := getFile(t, fs, ctx, "/doc.txt")
+	if !bytes.Equal(got2, plain2) {
+		t.Errorf("覆盖后读回不匹配: got %q, want %q", got2, plain2)
+	}
+
+	// Stat 大小应为新内容大小
+	fi, err := fs.Stat(ctx, "/doc.txt")
+	if err != nil {
+		t.Fatalf("Stat /doc.txt: %v", err)
+	}
+	if fi.Size() != int64(len(plain2)) {
+		t.Errorf("Stat size = %d, want %d", fi.Size(), len(plain2))
+	}
+
+	// 根目录列表应该仍只有一个 doc.txt
+	entries := listDir(t, fs, ctx, "/")
+	if len(entries) != 1 {
+		t.Errorf("根目录条目数 = %d, want 1（不应出现 doc(1).txt）", len(entries))
+	}
+	for name := range entries {
+		if name != "doc.txt" {
+			t.Errorf("根目录出现意外条目: %q（预期只有 doc.txt）", name)
+		}
 	}
 }
